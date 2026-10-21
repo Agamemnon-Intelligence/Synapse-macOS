@@ -6,7 +6,7 @@ struct SynapseApp: App {
     @State private var app = AppState()
 
     var body: some Scene {
-        WindowGroup("Synapse") {
+        Window("Synapse", id: "main") {
             ContentView()
                 .environment(app)
                 .frame(minWidth: 980, minHeight: 640)
@@ -48,4 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    override init() {
+        // Always open the main window at launch instead of restoring a "no windows" state.
+        UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
+        super.init()
+    }
 }

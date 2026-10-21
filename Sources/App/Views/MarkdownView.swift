@@ -43,7 +43,23 @@ struct MarkdownView: View {
     }
 
     static func inline(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+        let text = simplifyMath(s)
+        return (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(text)
+    }
+
+    /// Turns simple inline LaTeX ($17 \times 23$) into plain symbols.
+    static func simplifyMath(_ s: String) -> String {
+        guard s.contains("$") || s.contains("\\") else { return s }
+        var out = s
+        let symbols: [(String, String)] = [("\\times", "×"), ("\\cdot", "·"), ("\\div", "÷"), ("\\pm", "±"), ("\\leq", "≤"), ("\\geq", "≥"),
+                                           ("\\le", "≤"), ("\\ge", "≥"), ("\\neq", "≠"), ("\\approx", "≈"), ("\\infty", "∞"),
+                                           ("\\sqrt", "√"), ("\\pi", "π"), ("\\rightarrow", "→"), ("\\to", "→"), ("\\sum", "Σ"),
+                                           ("\\alpha", "α"), ("\\beta", "β"), ("\\theta", "θ"), ("\\lambda", "λ"), ("\\mu", "μ")]
+        for (k, v) in symbols { out = out.replacingOccurrences(of: k, with: v) }
+        out = out.replacingOccurrences(of: #"\\(?:text|mathrm|mathbf)\{([^}]*)\}"#, with: "$1", options: .regularExpression)
+        out = out.replacingOccurrences(of: #"\\frac\{([^}]*)\}\{([^}]*)\}"#, with: "$1⁄$2", options: .regularExpression)
+        out = out.replacingOccurrences(of: #"\$\$?([^$\n]+?)\$\$?"#, with: "$1", options: .regularExpression)
+        return out
     }
 
     static func parse(_ text: String) -> [Block] {

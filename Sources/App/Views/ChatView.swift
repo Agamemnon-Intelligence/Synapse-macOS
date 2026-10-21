@@ -360,11 +360,11 @@ struct MessageRow: View {
 
     private var assistantRow: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !message.reasoning.isEmpty {
-                ReasoningView(text: message.reasoning, live: live && message.content.isEmpty)
-            }
-            if message.content.isEmpty && message.toolCalls.isEmpty && message.reasoning.isEmpty && live {
-                TypingDots()
+            if live && message.content.isEmpty && message.toolCalls.isEmpty {
+                if message.reasoning.isEmpty && message.status == nil { TypingDots() }
+                else { ThinkingIndicator(message: message, live: true) }
+            } else if message.content.isEmpty == false && message.thinkingSeconds != nil {
+                ThinkingIndicator(message: message, live: false)
             }
             if !message.content.isEmpty {
                 if message.isError {
@@ -394,32 +394,23 @@ struct MessageRow: View {
     }
 }
 
-struct ReasoningView: View {
-    let text: String
+/// Thinking is private: show that the model is thinking (and for how long), never what it thought.
+struct ThinkingIndicator: View {
+    let message: ChatMessage
     let live: Bool
-    @State private var expanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button { withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() } } label: {
-                HStack(spacing: 5) {
-                    Text(live ? "Thinking" : "Thought process")
-                    if live { ProgressView().controlSize(.mini) }
-                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
+        if live {
+            TimelineView(.periodic(from: .now, by: 1)) { t in
+                HStack(spacing: 7) {
+                    PulsingDot()
+                    Text(message.status ?? "Thinking")
+                    Text("\(Int(t.date.timeIntervalSince(message.createdAt)))s").monospacedDigit().foregroundStyle(.tertiary)
                 }
                 .font(.callout).foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
-            if expanded {
-                Text(text)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 12)
-                    .overlay(alignment: .leading) { Rectangle().fill(Theme.border).frame(width: 2) }
-            }
+        } else if let s = message.thinkingSeconds, s >= 1 {
+            Text("Thought for \(Int(s.rounded()))s").font(.caption).foregroundStyle(.tertiary)
         }
     }
 }

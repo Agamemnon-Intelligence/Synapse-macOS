@@ -1,5 +1,5 @@
 // Renders the Synapse app icon. Usage: swift Scripts/make_icon.swift <output.png>
-// Light tile with a glossy S-shaped signal path and a spark where its two halves meet.
+// Dark tile with a signal arc joining two glowing nodes.
 import AppKit
 
 let size: CGFloat = 1024
@@ -9,81 +9,77 @@ let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size), pixelsH
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 let ctx = NSGraphicsContext.current!.cgContext
+// Flip so y grows downward, matching the SwiftUI logo geometry.
 ctx.translateBy(x: 0, y: size)
-ctx.scaleBy(x: 1, y: -1)   // y grows downward
+ctx.scaleBy(x: 1, y: -1)
 
+func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> CGColor { CGColor(red: r, green: g, blue: b, alpha: a) }
+let pink = color(1.0, 0.36, 0.74), violet = color(0.49, 0.36, 1.0), cyan = color(0.16, 0.80, 1.0)
 let space = CGColorSpaceCreateDeviceRGB()
-func rgb(_ hex: UInt32, _ a: CGFloat = 1) -> CGColor {
-    CGColor(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255, blue: CGFloat(hex & 0xFF) / 255, alpha: a)
-}
-func lighter(_ c: CGColor, _ t: CGFloat) -> CGColor {
-    let p = c.components!
-    return CGColor(red: p[0] + (1 - p[0]) * t, green: p[1] + (1 - p[1]) * t, blue: p[2] + (1 - p[2]) * t, alpha: 1)
-}
-func darker(_ c: CGColor, _ t: CGFloat) -> CGColor {
-    let p = c.components!
-    return CGColor(red: p[0] * (1 - t), green: p[1] * (1 - t), blue: p[2] * (1 - t), alpha: 1)
-}
 
-// Tile (macOS grid: 824 px tile inside a 1024 canvas)
+// macOS icon grid: 824 px tile centered in a 1024 canvas.
 let inset: CGFloat = 100
 let tile = CGRect(x: inset, y: inset, width: size - inset * 2, height: size - inset * 2)
 let w = tile.width
-let tilePath = CGPath(roundedRect: tile, cornerWidth: w * 0.225, cornerHeight: w * 0.225, transform: nil)
-ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: 10), blur: 24, color: rgb(0x000000, 0.22))
-ctx.addPath(tilePath); ctx.setFillColor(rgb(0xF4F4F6)); ctx.fillPath()
-ctx.restoreGState()
-ctx.saveGState()
-ctx.addPath(tilePath); ctx.clip()
-let bg = CGGradient(colorsSpace: space, colors: [rgb(0xFFFFFF), rgb(0xE9E9EE)] as CFArray, locations: [0, 1])!
-ctx.drawLinearGradient(bg, start: CGPoint(x: tile.midX, y: tile.minY), end: CGPoint(x: tile.midX, y: tile.maxY), options: [])
-ctx.restoreGState()
-ctx.addPath(tilePath); ctx.setStrokeColor(rgb(0x000000, 0.06)); ctx.setLineWidth(2); ctx.strokePath()
-
 func P(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: tile.minX + w * x, y: tile.minY + w * y) }
 
-/// Draws a glossy candy-like shape.
-func glossy(_ path: CGPath, _ base: CGColor) {
-    let box = path.boundingBox
-    // colored soft shadow
+// Drop shadow + tile
+ctx.saveGState()
+ctx.setShadow(offset: CGSize(width: 0, height: 14), blur: 30, color: color(0, 0, 0, 0.35))
+let tilePath = CGPath(roundedRect: tile, cornerWidth: w * 0.225, cornerHeight: w * 0.225, transform: nil)
+ctx.addPath(tilePath)
+ctx.setFillColor(color(0.05, 0.04, 0.14))
+ctx.fillPath()
+ctx.restoreGState()
+
+ctx.saveGState()
+ctx.addPath(tilePath)
+ctx.clip()
+let bg = CGGradient(colorsSpace: space, colors: [color(0.15, 0.10, 0.34), color(0.03, 0.03, 0.10)] as CFArray, locations: [0, 1])!
+ctx.drawLinearGradient(bg, start: tile.origin, end: CGPoint(x: tile.maxX, y: tile.maxY), options: [])
+// Soft glow in the middle
+let glowG = CGGradient(colorsSpace: space, colors: [color(0.49, 0.36, 1.0, 0.35), color(0.49, 0.36, 1.0, 0)] as CFArray, locations: [0, 1])!
+ctx.drawRadialGradient(glowG, startCenter: P(0.5, 0.5), startRadius: 0, endCenter: P(0.5, 0.5), endRadius: w * 0.55, options: [])
+
+// Signal arc
+let a = P(0.27, 0.70), b = P(0.73, 0.30)
+let arc = CGMutablePath()
+arc.move(to: a)
+arc.addCurve(to: b, control1: P(0.27, 0.26), control2: P(0.73, 0.74))
+let lineG = CGGradient(colorsSpace: space, colors: [pink, violet, cyan] as CFArray, locations: [0, 0.5, 1])!
+
+func strokeArc(width: CGFloat, blur: CGFloat, alpha: CGFloat) {
     ctx.saveGState()
-    ctx.setShadow(offset: CGSize(width: 0, height: w * 0.018), blur: w * 0.035, color: darker(base, 0.1).copy(alpha: 0.45)!)
-    ctx.addPath(path); ctx.setFillColor(base); ctx.fillPath()
+    if blur > 0 { ctx.setShadow(offset: .zero, blur: blur, color: color(0.6, 0.45, 1.0, 0.9)) }
+    ctx.setAlpha(alpha)
+    ctx.addPath(arc)
+    ctx.setLineWidth(width)
+    ctx.setLineCap(.round)
+    ctx.replacePathWithStrokedPath()
+    ctx.clip()
+    ctx.drawLinearGradient(lineG, start: a, end: b, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
     ctx.restoreGState()
-    // body gradient
+}
+strokeArc(width: w * 0.13, blur: w * 0.06, alpha: 0.45)
+strokeArc(width: w * 0.075, blur: 0, alpha: 1)
+
+// Nodes
+for (p, c, r) in [(a, pink, 0.105), (b, cyan, 0.105), (P(0.5, 0.5), color(1, 1, 1), 0.055)] as [(CGPoint, CGColor, CGFloat)] {
+    let rr = w * r
     ctx.saveGState()
-    ctx.addPath(path); ctx.clip()
-    let body = CGGradient(colorsSpace: space, colors: [lighter(base, 0.28), base, darker(base, 0.08)] as CFArray, locations: [0, 0.55, 1])!
-    ctx.drawLinearGradient(body, start: CGPoint(x: box.midX, y: box.minY), end: CGPoint(x: box.midX, y: box.maxY), options: [])
-    // top gloss
-    let gloss = CGRect(x: box.minX + box.width * 0.12, y: box.minY + box.height * 0.06, width: box.width * 0.76, height: box.height * 0.42)
-    let glossPath = CGPath(roundedRect: gloss, cornerWidth: min(gloss.width, gloss.height) / 2, cornerHeight: min(gloss.width, gloss.height) / 2, transform: nil)
-    ctx.addPath(glossPath); ctx.clip()
-    let g = CGGradient(colorsSpace: space, colors: [rgb(0xFFFFFF, 0.55), rgb(0xFFFFFF, 0.0)] as CFArray, locations: [0, 1])!
-    ctx.drawLinearGradient(g, start: CGPoint(x: gloss.midX, y: gloss.minY), end: CGPoint(x: gloss.midX, y: gloss.maxY), options: [])
+    ctx.setShadow(offset: .zero, blur: rr * 1.6, color: c)
+    ctx.setFillColor(c)
+    ctx.fillEllipse(in: CGRect(x: p.x - rr, y: p.y - rr, width: rr * 2, height: rr * 2))
     ctx.restoreGState()
-    // crisp rim
-    ctx.addPath(path); ctx.setStrokeColor(darker(base, 0.12).copy(alpha: 0.35)!); ctx.setLineWidth(w * 0.006); ctx.strokePath()
+    ctx.setFillColor(color(1, 1, 1, 0.85))
+    let ir = rr * 0.45
+    ctx.fillEllipse(in: CGRect(x: p.x - ir, y: p.y - ir, width: ir * 2, height: ir * 2))
 }
 
-func capsule(_ r: CGRect) -> CGPath {
-    CGPath(roundedRect: r, cornerWidth: min(r.width, r.height) / 2, cornerHeight: min(r.width, r.height) / 2, transform: nil)
-}
-
-let blue = rgb(0x3D8BFF), violet = rgb(0xA15CF6), coral = rgb(0xFF6B5B), teal = rgb(0x14C8C0)
-
-// An S-shaped signal path: two glossy arcs and a spark where they meet.
-func arcTube(_ center: CGPoint, _ radius: CGFloat, _ start: CGFloat, _ end: CGFloat, clockwise: Bool, _ c: CGColor) {
-    let p = CGMutablePath()
-    p.addArc(center: center, radius: radius, startAngle: start, endAngle: end, clockwise: clockwise)
-    glossy(p.copy(strokingWithWidth: w * 0.12, lineCap: .round, lineJoin: .round, miterLimit: 1), c)
-}
-arcTube(P(0.5, 0.36), w * 0.14, -.pi * 0.08, .pi * 0.62, clockwise: true, blue)
-arcTube(P(0.5, 0.64), w * 0.14, -.pi * 0.38, .pi * 0.92, clockwise: false, violet)
-let r = w * 0.048
-let sp = P(0.5, 0.5)
-glossy(CGPath(ellipseIn: CGRect(x: sp.x - r, y: sp.y - r, width: r * 2, height: r * 2), transform: nil), coral)
+// Subtle top highlight
+let hl = CGGradient(colorsSpace: space, colors: [color(1, 1, 1, 0.10), color(1, 1, 1, 0)] as CFArray, locations: [0, 1])!
+ctx.drawLinearGradient(hl, start: CGPoint(x: tile.midX, y: tile.minY), end: CGPoint(x: tile.midX, y: tile.minY + w * 0.45), options: [])
+ctx.restoreGState()
 
 NSGraphicsContext.restoreGraphicsState()
 try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))

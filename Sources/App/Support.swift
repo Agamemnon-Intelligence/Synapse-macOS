@@ -1,5 +1,4 @@
 import Foundation
-import Security
 import AppKit
 
 // MARK: - Paths
@@ -36,36 +35,42 @@ enum Paths {
 
 // MARK: - Keychain
 
+/// API keys live in the login keychain. Access goes through Apple's `security` tool so items stay
+/// readable across rebuilds (an unsigned app's identity changes every build, which would re-prompt).
 enum Keychain {
     static let service = "com.athenesoftworks.synapse"
+    private static var cache: [String: String] = [:]
+    private static var misses: Set<String> = []
+    private static let lock = NSLock()
 
     static func get(_ account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var out: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (s?.isEmpty ?? true) ? nil : s
+        lock.lock()
+        if let v = cache[account] { lock.unlock(); return v }
+        if misses.contains(account) { lock.unlock(); return nil }
+        lock.unlock()
+        let r = runProcess("/usr/bin/security", ["find-generic-password", "-s", service, "-a", account, "-w"], timeout: 10)
+        let value = r.status == 0 ? r.output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        lock.lock(); defer { lock.unlock() }
+        if value.isEmpty { misses.insert(account); return nil }
+        cache[account] = value
+        return value
     }
 
     static func set(_ value: String?, for account: String) {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
+        runProcess("/usr/bin/security", ["delete-generic-password", "-s", service, "-a", account], timeout: 10)
+        lock.lock()
+        cache[account] = nil
+        misses.insert(account)
+        lock.unlock()
         guard let value, !value.isEmpty else { return }
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrLabel as String] = "Synapse – \(account)"
-        SecItemAdd(add as CFDictionary, nil)
+        let r = runProcess("/usr/bin/security", ["add-generic-password", "-U", "-A", "-s", service, "-a", account,
+                                                  "-l", "Synapse – \(account)", "-w", value], timeout: 10)
+        if r.status == 0 {
+            lock.lock()
+            cache[account] = value
+            misses.remove(account)
+            lock.unlock()
+        }
     }
 }
 

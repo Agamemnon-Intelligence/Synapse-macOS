@@ -188,7 +188,9 @@ struct ChatMessage: Codable, Hashable, Identifiable {
     var id = UUID()
     var role: Role
     var content: String = ""
-    var reasoning: String = ""
+    var reasoning: String = ""             // kept for context, never shown
+    var thinkingSeconds: Double?
+    var status: String?                      // e.g. "Loading model…"
     var attachments: [Attachment] = []
     var toolCalls: [ToolCall] = []
     var toolCallID: String?

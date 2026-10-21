@@ -37,25 +37,21 @@ struct GlassGroup<Content: View>: View {
     }
 }
 
-/// Deep backdrop with soft color, so the glass has something to refract.
+/// Dark graphite backdrop with a faint cool glow, so the glass has something to refract.
 struct Backdrop: View {
     var body: some View {
         ZStack {
             Theme.background
             GeometryReader { geo in
                 let w = geo.size.width, h = geo.size.height
-                Circle().fill(Theme.markBlue.opacity(0.16))
+                Circle().fill(Theme.accent.opacity(0.07))
                     .frame(width: w * 0.7, height: w * 0.7)
-                    .blur(radius: 120)
-                    .position(x: w * 0.15, y: h * 0.05)
-                Circle().fill(Theme.markViolet.opacity(0.13))
-                    .frame(width: w * 0.6, height: w * 0.6)
-                    .blur(radius: 130)
-                    .position(x: w * 0.95, y: h * 0.95)
-                Circle().fill(Theme.markCoral.opacity(0.05))
-                    .frame(width: w * 0.35, height: w * 0.35)
-                    .blur(radius: 110)
-                    .position(x: w * 0.75, y: h * 0.2)
+                    .blur(radius: 140)
+                    .position(x: w * 0.1, y: h * 0.0)
+                Circle().fill(Color.white.opacity(0.025))
+                    .frame(width: w * 0.55, height: w * 0.55)
+                    .blur(radius: 140)
+                    .position(x: w * 0.95, y: h * 1.0)
             }
         }
         .ignoresSafeArea()

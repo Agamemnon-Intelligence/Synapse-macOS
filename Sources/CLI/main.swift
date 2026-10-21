@@ -51,7 +51,7 @@ func listModels() async -> [(id: String, name: String)] {
     return list.compactMap { m in (m["id"] as? String).map { ($0, m["name"] as? String ?? $0) } }
 }
 
-/// Streams a reply, printing reasoning dimmed and content normally. Returns the content.
+/// Streams a reply and prints the answer (thinking is hidden). Returns the content.
 func stream(model: String, messages: [[String: Any]], think: String?) async -> String? {
     var body: [String: Any] = ["model": model, "messages": messages, "stream": true]
     if let think { body["synapse_think"] = think }
@@ -72,11 +72,13 @@ func stream(model: String, messages: [[String: Any]], think: String?) async -> S
         var content = ""
         var inReasoning = false
         var inTag = false
+        // Thoughts stay private: show a placeholder while the model thinks, then clear it.
         func emit(_ s: String, reasoning: Bool) {
-            if reasoning != inReasoning {
-                print(reasoning ? "\(dim)" : "\(reset)\n", terminator: "")
-                inReasoning = reasoning
+            if reasoning {
+                if !inReasoning { print("\(dim)Thinking…\(reset)", terminator: ""); fflush(stdout); inReasoning = true }
+                return
             }
+            if inReasoning { print("\r\u{001B}[K", terminator: ""); inReasoning = false }
             print(s, terminator: "")
             fflush(stdout)
         }

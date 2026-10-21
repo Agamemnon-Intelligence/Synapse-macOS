@@ -8,6 +8,8 @@ struct Agent {
     let chatID: UUID
     static let maxSteps = 30
     static let googleFallback = "gemini-flash-lite-latest"
+    /// After Google reports a model as busy, skip it for a while instead of waiting on it every turn.
+    static var googleBusy: [String: Date] = [:]
 
     var chat: Chat? { app.chatIndex(chatID).map { app.chats[$0] } }
 
@@ -26,9 +28,9 @@ struct Agent {
                 return
             }
             let placeholder = append(ChatMessage(role: .assistant, content: "", modelName: model.name))
-            setReasoning(placeholder, "Loading \(local.displayName) into memory…")
+            update(placeholder) { $0.status = "Loading \(local.displayName)…" }
             do { try await app.loadLocal(local) } catch {
-                update(placeholder) { $0.reasoning = ""; $0.content = error.localizedDescription; $0.isError = true }
+                update(placeholder) { $0.status = nil; $0.content = error.localizedDescription; $0.isError = true }
                 return
             }
             remove(placeholder)
@@ -83,15 +85,26 @@ struct Agent {
         if !tools.isEmpty { body["tools"] = tools }
         let thinkParams = Self.thinkingParams(provider: model.provider, model: model.id, level: think)
         var attempt = body.merging(thinkParams) { $1 }
+        if model.provider == .google, let until = Self.googleBusy[model.id], until > Date() {
+            attempt["model"] = Self.googleFallback
+            update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) is busy)" }
+        }
 
         for tryNumber in 0..<4 {
             do {
                 return try await streamOnce(into: msgID, provider: model.provider, modelID: model.id, body: attempt)
+            } catch let e as URLError where e.code == .timedOut && model.provider == .google
+                        && (attempt["model"] as? String) != Self.googleFallback && chatMessage(msgID)?.content.isEmpty != false {
+                attempt["model"] = Self.googleFallback
+                Self.googleBusy[model.id] = Date().addingTimeInterval(600)
+                update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) timed out)" }
+                continue
             } catch let e as APIError where e.status == 503 && model.provider == .google
                         && (attempt["model"] as? String) != Self.googleFallback && chatMessage(msgID)?.content.isEmpty != false {
                 // Google is overloaded: answer with the lighter model instead of failing.
                 attempt["model"] = Self.googleFallback
-                update(msgID) { $0.modelName = Self.googleFallback + " (fallback: \(model.name) is busy)" }
+                Self.googleBusy[model.id] = Date().addingTimeInterval(600)
+                update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) is busy)" }
                 continue
             } catch let e as APIError where e.status == 400 || e.status == 422 {
                 // Some models reject reasoning or tool parameters: retry with fewer extras.
@@ -100,7 +113,6 @@ struct Agent {
                 if tryNumber == 0 && !thinkParams.isEmpty { attempt = body; continue }
                 if attempt["tools"] != nil && e.message.lowercased().contains("tool") {
                     attempt["tools"] = nil
-                    update(msgID) { $0.reasoning += "(This model doesn't support tools, so capabilities are off for this reply.)\n" }
                     continue
                 }
                 throw e
@@ -114,6 +126,13 @@ struct Agent {
         var calls: [ToolCall] = []
         var pendingContent = "", pendingReasoning = ""
         var lastFlush = Date()
+        var thinkStart: Date?
+        func endThinking() {
+            guard let start = thinkStart else { return }
+            let elapsed = Date().timeIntervalSince(start)
+            update(msgID) { $0.thinkingSeconds = ($0.thinkingSeconds ?? 0) + elapsed }
+            thinkStart = nil
+        }
         func flush() {
             guard !pendingContent.isEmpty || !pendingReasoning.isEmpty else { return }
             let c = pendingContent, r = pendingReasoning
@@ -125,8 +144,8 @@ struct Agent {
             for try await event in ChatClient.stream(provider: provider, body: body) {
                 try Task.checkCancellation()
                 switch event {
-                case .content(let s): pendingContent += s
-                case .reasoning(let s): pendingReasoning += s
+                case .content(let s): endThinking(); pendingContent += s
+                case .reasoning(let s): if thinkStart == nil { thinkStart = Date() }; pendingReasoning += s
                 case .toolCalls(let c): calls = c
                 case .usage(let u): app.usage.recordTokens(provider, u)
                 case .rateLimit(let r): app.usage.recordRateLimit(provider, r)
@@ -135,10 +154,12 @@ struct Agent {
             }
         } catch {
             flush()
+            endThinking()
             if let e = error as? APIError, e.status == 429 { app.usage.recordLimitError(provider, e.message) }
             throw error
         }
         flush()
+        endThinking()
         // Strip leading whitespace some models emit after thinking.
         update(msgID) { $0.content = $0.content.trimmingCharacters(in: .whitespacesAndNewlines) }
         return calls
@@ -157,6 +178,7 @@ struct Agent {
         update(msgID) {
             $0.reasoning += ($0.reasoning.isEmpty ? "" : "\n\n") + "── First draft ──\n" + draft + "\n\n── Reviewing and refining ──\n"
             $0.content = ""
+            $0.status = "Double-checking"
         }
         var body: [String: Any] = ["model": requestModel, "messages": messages]
         body.merge(Self.thinkingParams(provider: model.provider, model: model.id, level: .high)) { $1 }
@@ -165,6 +187,7 @@ struct Agent {
         } catch {
             if (chatMessage(msgID)?.content ?? "").isEmpty { update(msgID) { $0.content = draft } }
         }
+        update(msgID) { $0.status = nil }
     }
 
     /// Provider-specific knobs that make a model reason more (or less).
@@ -348,7 +371,6 @@ struct Agent {
         f(&app.chats[i].messages[j])
     }
 
-    private func setReasoning(_ id: UUID, _ s: String) { update(id) { $0.reasoning = s } }
 
     private func remove(_ id: UUID) {
         guard let i = app.chatIndex(chatID) else { return }

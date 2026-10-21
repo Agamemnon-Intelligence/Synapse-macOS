@@ -86,7 +86,8 @@ enum ChatClient {
 
     static func makeRequest(provider: ProviderID, path: String, body: [String: Any]?) throws -> URLRequest {
         guard let url = URL(string: provider.baseURL + path) else { throw APIError(status: 0, message: "Bad base URL") }
-        var req = URLRequest(url: url, timeoutInterval: 600)
+        // Idle timeout: cloud servers that stall get cut off; local engines may need longer for big prompts.
+        var req = URLRequest(url: url, timeoutInterval: provider == .local ? 600 : 60)
         if let key = apiKey(for: provider) { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
         if provider == .openrouter {
             req.setValue("https://github.com/Agamemnon-Intelligence/Synapse-macOS", forHTTPHeaderField: "HTTP-Referer")
