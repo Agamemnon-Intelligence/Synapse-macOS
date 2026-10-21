@@ -1,0 +1,61 @@
+name: Release
+
+# Builds Synapse and publishes a GitHub release for the version in project.yml.
+# Runs on every push to main; does nothing if that version is already released.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(grep -E 'MARKETING_VERSION:' project.yml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select newest Xcode
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Build
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project Synapse.xcodeproj -scheme Synapse -configuration Release \
+            -derivedDataPath build -destination 'generic/platform=macOS' \
+            CODE_SIGN_IDENTITY="-" ONLY_ACTIVE_ARCH=NO build -quiet
+          APP=build/Build/Products/Release/Synapse.app
+          codesign --force --sign - "$APP/Contents/MacOS/synapse-cli"
+          codesign --force --sign - "$APP"
+          ditto -c -k --keepParent "$APP" Synapse-macOS.zip
+
+      - name: Publish release
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" Synapse-macOS.zip \
+            --title "Synapse ${{ steps.version.outputs.version }}" \
+            --notes "Run AI models on your Mac, or use free cloud models, in one native app.
+
+          **Install:** unzip, move Synapse to Applications, then open it. On first launch macOS may block it: open System Settings › Privacy & Security and click **Open Anyway**.
+
+          Requires macOS 14 or later."
