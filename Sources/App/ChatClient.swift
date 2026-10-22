@@ -20,13 +20,29 @@ struct RateLimitInfo: Codable, Hashable {
             for (key, v) in headers where (key as? String)?.lowercased() == k { return v as? String }
             return nil
         }
-        limitRequests = h("x-ratelimit-limit-requests").flatMap(Int.init)
-        remainingRequests = h("x-ratelimit-remaining-requests").flatMap(Int.init)
-        resetRequests = h("x-ratelimit-reset-requests")
-        limitTokens = h("x-ratelimit-limit-tokens").flatMap(Int.init)
-        remainingTokens = h("x-ratelimit-remaining-tokens").flatMap(Int.init)
-        resetTokens = h("x-ratelimit-reset-tokens")
+        // OpenAI-style headers (Groq, OpenRouter, DeepSeek) or Anthropic's own.
+        limitRequests = (h("x-ratelimit-limit-requests") ?? h("anthropic-ratelimit-requests-limit")).flatMap(Int.init)
+        remainingRequests = (h("x-ratelimit-remaining-requests") ?? h("anthropic-ratelimit-requests-remaining")).flatMap(Int.init)
+        resetRequests = h("x-ratelimit-reset-requests") ?? h("anthropic-ratelimit-requests-reset").map(Self.untilReset)
+        limitTokens = (h("x-ratelimit-limit-tokens") ?? h("anthropic-ratelimit-tokens-limit")).flatMap(Int.init)
+        remainingTokens = (h("x-ratelimit-remaining-tokens") ?? h("anthropic-ratelimit-tokens-remaining")).flatMap(Int.init)
+        resetTokens = h("x-ratelimit-reset-tokens") ?? h("anthropic-ratelimit-tokens-reset").map(Self.untilReset)
         if limitRequests == nil && limitTokens == nil && remainingRequests == nil { return nil }
+    }
+
+    /// Anthropic sends reset times as timestamps; show them as "42s" like the others.
+    static func untilReset(_ iso: String) -> String {
+        guard let d = ISO8601DateFormatter().date(from: iso) else { return iso }
+        let s = max(0, Int(d.timeIntervalSinceNow))
+        return s >= 60 ? "\(s / 60)m\(s % 60)s" : "\(s)s"
+    }
+
+    /// The smallest remaining share of requests or tokens, 0...1 (nil when unknown).
+    var lowestRemainingFraction: Double? {
+        var fractions: [Double] = []
+        if let l = limitRequests, let r = remainingRequests, l > 0 { fractions.append(Double(r) / Double(l)) }
+        if let l = limitTokens, let r = remainingTokens, l > 0 { fractions.append(Double(r) / Double(l)) }
+        return fractions.min()
     }
 }
 
@@ -38,6 +54,8 @@ enum StreamEvent {
     case toolCalls([ToolCall])   // final, assembled
     case usage(TokenUsage)
     case rateLimit(RateLimitInfo)
+    case providerBlocks(JSONValue)   // Claude: the assistant turn's raw content blocks
+    case notice(String)              // e.g. Claude declined, or a fallback model answered
 }
 
 /// Splits `<think>…</think>` / `<thought>…</thought>` out of streamed content.
@@ -88,7 +106,12 @@ enum ChatClient {
         guard let url = URL(string: provider.baseURL + path) else { throw APIError(status: 0, message: "Bad base URL") }
         // Idle timeout: cloud servers that stall get cut off; local engines may need longer for big prompts.
         var req = URLRequest(url: url, timeoutInterval: provider == .local ? 600 : 60)
-        if let key = apiKey(for: provider) { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        if provider == .anthropic {
+            if let key = apiKey(for: provider) { req.setValue(key, forHTTPHeaderField: "x-api-key") }
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        } else if let key = apiKey(for: provider) {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         if provider == .openrouter {
             req.setValue("https://github.com/Agamemnon-Intelligence/Synapse-macOS", forHTTPHeaderField: "HTTP-Referer")
             req.setValue("Synapse", forHTTPHeaderField: "X-Title")
@@ -99,6 +122,18 @@ enum ChatClient {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
         return req
+    }
+
+    /// The numeric status inside an error body (Google puts `{"error": {"code": 503}}` in streams).
+    static func errorStatus(from data: Data) -> Int {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return 0 }
+        let o = (obj as? [Any])?.first ?? obj
+        if let d = o as? [String: Any], let e = d["error"] as? [String: Any] {
+            if let c = e["code"] as? Int { return c }
+            if let c = e["code"] as? String, let n = Int(c) { return n }
+            if let st = e["status"] as? String { return st == "UNAVAILABLE" ? 503 : st == "RESOURCE_EXHAUSTED" ? 429 : 0 }
+        }
+        return 0
     }
 
     static func errorMessage(from data: Data) -> String {
@@ -115,7 +150,8 @@ enum ChatClient {
 
     /// Streams an OpenAI-compatible chat completion.
     static func stream(provider: ProviderID, body: [String: Any]) -> AsyncThrowingStream<StreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        if provider == .anthropic { return AnthropicClient.stream(body: body) }
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     var body = body
@@ -147,7 +183,7 @@ enum ChatClient {
                         guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else { continue }
                         if let err = obj["error"] {
                             let data = (try? JSONSerialization.data(withJSONObject: ["error": err])) ?? Data()
-                            throw APIError(status: 0, message: errorMessage(from: data))
+                            throw APIError(status: errorStatus(from: data), message: errorMessage(from: data))
                         }
                         if let u = obj["usage"] as? [String: Any] {
                             continuation.yield(.usage(TokenUsage(prompt: u["prompt_tokens"] as? Int ?? 0,
@@ -198,7 +234,7 @@ enum ChatClient {
                                 if !content.isEmpty { continuation.yield(.content(content)) }
                             }
                         } else if calls.isEmpty {
-                            throw APIError(status: 0, message: errorMessage(from: nonSSE))
+                            throw APIError(status: errorStatus(from: nonSSE), message: errorMessage(from: nonSSE))
                         }
                     }
                     let rest = splitter.flush()
@@ -229,7 +265,7 @@ enum ChatClient {
             guard var id = m["id"] as? String else { continue }
             if id.hasPrefix("models/") { id = String(id.dropFirst(7)) }
             if !isChatModel(provider: provider, id: id, raw: m) { continue }
-            let name = (m["name"] as? String) ?? id
+            let name = (m["display_name"] as? String) ?? (m["name"] as? String) ?? id
             refs.append(ModelRef(provider: provider, id: id, name: name, vision: guessVision(provider: provider, id: id, raw: m)))
         }
         return refs.sorted { rank(provider, $0.id) < rank(provider, $1.id) }
@@ -248,7 +284,7 @@ enum ChatClient {
 
     private static func guessVision(provider: ProviderID, id: String, raw: [String: Any]) -> Bool {
         let l = id.lowercased()
-        if provider == .google { return true }
+        if provider == .google || provider == .anthropic { return true }
         if let arch = raw["architecture"] as? [String: Any], let mods = arch["input_modalities"] as? [String] {
             return mods.contains("image")
         }
@@ -259,7 +295,10 @@ enum ChatClient {
         let l = id.lowercased()
         let preferred: [String]
         switch provider {
-        case .google: preferred = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.7-flash", "gemini-pro-latest", "gemini-3.1-pro", "gemini-flash-lite-latest"]
+        case .google: preferred = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest",
+                                   "gemini-3-flash", "gemini-pro-latest", "gemini-3.1-pro", "gemini-flash-lite-latest", "gemini-3.5-flash-lite"]
+        case .anthropic: preferred = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]
+        case .deepseek: preferred = ["deepseek-chat", "deepseek-reasoner"]
         case .groq: preferred = ["openai/gpt-oss-120b", "llama-3.3-70b", "moonshotai/kimi", "qwen/qwen3", "openai/gpt-oss-20b", "meta-llama/llama-4"]
         default: preferred = []
         }

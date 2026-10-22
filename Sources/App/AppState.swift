@@ -14,6 +14,7 @@ struct ApprovalRequest: Identifiable {
     let id = UUID()
     let title: String
     let detail: String
+    var diff: FileDiff? = nil
     let continuation: CheckedContinuation<Bool, Never>
 }
 
@@ -40,6 +41,8 @@ final class AppState {
     var approvals: [ApprovalRequest] = []
     var generating: Set<UUID> = []
     var keysVersion = 0   // bump to refresh views that read the keychain
+    var modelHealth: [String: ModelHealthRecord] = ModelHealthRecord.load()
+    var dismissedWarnings: Set<String> = []
 
     // Services
     let engine = LocalEngine()
@@ -48,11 +51,13 @@ final class AppState {
     let sites = SiteManager()
     let usage = UsageTracker()
     let settings = AppSettings.shared
+    let controlOverlay = ControlOverlay()
     private var tasks: [UUID: Task<Void, Never>] = [:]
     private var apiServer: HTTPServer?
 
     init() {
         load()
+        controlOverlay.onStop = { [weak self] id in self?.stop(id) }
         downloads.onComplete = { [weak self] model in
             guard let self else { return }
             self.localModels.removeAll { $0.id == model.id }
@@ -94,7 +99,7 @@ final class AppState {
     }
 
     func refreshRemoteModels(only: ProviderID? = nil) async {
-        let providers = only.map { [$0] } ?? [.google, .groq, .openrouter, .custom]
+        let providers = only.map { [$0] } ?? [.google, .groq, .anthropic, .deepseek, .openrouter, .custom]
         await withTaskGroup(of: (ProviderID, Result<[ModelRef], Error>?).self) { group in
             for p in providers {
                 let enabled = p == .custom ? settings.customEnabled : Keychain.get(p.rawValue) != nil
@@ -107,7 +112,9 @@ final class AppState {
             for await (p, result) in group {
                 switch result {
                 case .none: remoteModels[p] = nil; remoteErrors[p] = nil
-                case .success(let list): remoteModels[p] = list; remoteErrors[p] = nil
+                case .success(let list):
+                    remoteModels[p] = list; remoteErrors[p] = nil
+                    if p == .google { Task { await probeGoogleModels(list) } }
                 case .failure(let e): remoteErrors[p] = e.localizedDescription
                 }
             }
@@ -131,9 +138,97 @@ final class AppState {
     var defaultModel: ModelRef? {
         if let d = settings.defaultModel {
             if d.provider == .local { if localModel(d.id) != nil { return d } }
-            else if hasKey(d.provider) { return d }
+            else if hasKey(d.provider), isUsable(d), health(d) != .busy { return d }
         }
-        return remoteModels[.google]?.first ?? remoteModels[.groq]?.first ?? localModels.first?.ref
+        let firstUsable: (ProviderID) -> ModelRef? = { p in self.remoteModels[p]?.first { self.isUsable($0) && self.health($0) != .busy } }
+        return firstUsable(.google) ?? firstUsable(.groq) ?? firstUsable(.anthropic) ?? firstUsable(.deepseek) ?? localModels.first?.ref
+    }
+
+    // MARK: Model health (which listed models actually work on this key)
+
+    func health(_ m: ModelRef) -> ModelHealth? { modelHealth[m.qualifiedID]?.health }
+
+    /// Hides models the provider lists but won't serve on this key (retired, or not on the free tier).
+    func isUsable(_ m: ModelRef) -> Bool {
+        if case .unavailable = health(m) { return false }
+        return true
+    }
+
+    func setModelHealth(_ m: ModelRef, _ h: ModelHealth) {
+        modelHealth[m.qualifiedID] = ModelHealthRecord(health: h, checked: Date())
+        ModelHealthRecord.save(modelHealth)
+    }
+
+    /// Google models to try, in order, when the chosen one is busy or unavailable.
+    var googleFallbackChain: [String] {
+        let preferred = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite",
+                         "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemma-4-26b-a4b-it", "gemma-4-31b-it"]
+        let list = remoteModels[.google] ?? []
+        let usable = preferred.filter { id in list.first(where: { $0.id == id }).map(isUsable) ?? false }
+        // Models not marked busy first, busy ones last (Google's "busy" often clears within minutes).
+        let notBusy = usable.filter { id in list.first { $0.id == id }.map { health($0) != .busy } ?? true }
+        let chain = notBusy + usable.filter { !notBusy.contains($0) }
+        return chain.isEmpty ? ["gemini-flash-lite-latest"] : chain
+    }
+
+    /// The Google model to answer with when the chosen one is busy or unavailable.
+    var googleFallbackModel: String {
+        let preferred = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite",
+                         "gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
+        let list = remoteModels[.google] ?? []
+        for id in preferred {
+            if let m = list.first(where: { $0.id == id }), isUsable(m), health(m) != .busy { return id }
+        }
+        return "gemini-flash-lite-latest"
+    }
+
+    /// Once a day, send a tiny request to each Google model so the picker only offers ones that work.
+    func probeGoogleModels(_ list: [ModelRef]) async {
+        let stale = list.filter { m in
+            guard let r = modelHealth[m.qualifiedID] else { return true }
+            return Date().timeIntervalSince(r.checked) > (r.health == .ok ? 86_400 : r.health == .busy ? 1_800 : 7 * 86_400)
+        }
+        guard !stale.isEmpty else { return }
+        await withTaskGroup(of: (ModelRef, ModelHealth?).self) { group in
+            for m in stale {
+                group.addTask {
+                    let body: [String: Any] = ["model": m.id, "max_tokens": 16, "messages": [["role": "user", "content": "Reply with OK."]]]
+                    guard var req = try? ChatClient.makeRequest(provider: .google, path: "/chat/completions", body: body) else { return (m, nil) }
+                    req.timeoutInterval = 25
+                    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                          let code = (resp as? HTTPURLResponse)?.statusCode else { return (m, .busy) }
+                    let message = ChatClient.errorMessage(from: data)
+                    switch code {
+                    case 200..<300: return (m, .ok)
+                    case 404: return (m, .unavailable("Retired for new keys"))
+                    case 429 where message.contains("limit: 0"): return (m, .unavailable("Not on the free tier"))
+                    case 429: return (m, .ok)            // works, just rate limited right now
+                    case 503, 500, 502, 504: return (m, .busy)
+                    default: return (m, nil)
+                    }
+                }
+            }
+            for await (m, h) in group { if let h { setModelHealth(m, h) } }
+        }
+    }
+
+    // MARK: Usage warnings
+
+    /// A short warning when a provider's limits are running low (shown above the composer).
+    func usageWarning(for p: ProviderID) -> String? {
+        guard p != .local else { return nil }
+        let u = usage.usage(p)
+        if let at = u.lastLimitErrorAt, Date().timeIntervalSince(at) < 15 * 60 {
+            return "You hit \(p.displayName)'s rate limit \(at.formatted(.relative(presentation: .named))). Wait a bit or switch models."
+        }
+        if let rl = u.rateLimit, Date().timeIntervalSince(rl.updatedAt) < 3_600, let f = rl.lowestRemainingFraction, f < 0.15 {
+            var parts: [String] = []
+            if let r = rl.remainingRequests, let l = rl.limitRequests { parts.append("\(r) of \(l) requests left") }
+            if let r = rl.remainingTokens, let l = rl.limitTokens, Double(r) / Double(max(l, 1)) < 0.15 { parts.append("\(r.formatted()) tokens left") }
+            let reset = rl.resetRequests ?? rl.resetTokens
+            return "\(p.displayName) is running low: " + parts.joined(separator: ", ") + (reset.map { " · resets in \($0)" } ?? "")
+        }
+        return nil
     }
 
     // MARK: Chats & projects
@@ -215,6 +310,7 @@ final class AppState {
         tasks[chatID] = Task {
             await Agent(app: self, chatID: chatID).run()
             browser.agentActive = false
+            controlOverlay.hide(chatID: chatID)
             generating.remove(chatID)
             tasks[chatID] = nil
             save()
@@ -222,6 +318,7 @@ final class AppState {
     }
 
     func stop(_ chatID: UUID) {
+        controlOverlay.hide(chatID: chatID)
         tasks[chatID]?.cancel()
         tasks[chatID] = nil
         generating.remove(chatID)
@@ -231,9 +328,9 @@ final class AppState {
         pending.forEach { $0.continuation.resume(returning: false) }
     }
 
-    func requestApproval(title: String, detail: String) async -> Bool {
+    func requestApproval(title: String, detail: String, diff: FileDiff? = nil) async -> Bool {
         await withCheckedContinuation { c in
-            approvals.append(ApprovalRequest(title: title, detail: detail, continuation: c))
+            approvals.append(ApprovalRequest(title: title, detail: detail, diff: diff, continuation: c))
         }
     }
 
@@ -364,5 +461,24 @@ final class AppState {
             } catch { continue }
         }
         return "Couldn't install. Run in Terminal:\nsudo ln -sf \"\(src)\" /usr/local/bin/synapse"
+    }
+}
+
+
+enum ModelHealth: Codable, Hashable {
+    case ok, busy
+    case unavailable(String)
+}
+
+struct ModelHealthRecord: Codable {
+    var health: ModelHealth
+    var checked: Date
+
+    static var file: URL { Paths.support.appendingPathComponent("model-health.json") }
+    static func load() -> [String: ModelHealthRecord] {
+        (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String: ModelHealthRecord].self, from: $0) } ?? [:]
+    }
+    static func save(_ all: [String: ModelHealthRecord]) {
+        if let data = try? JSONEncoder().encode(all) { try? data.write(to: file) }
     }
 }

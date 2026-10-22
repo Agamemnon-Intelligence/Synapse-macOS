@@ -7,9 +7,11 @@ struct Agent {
     let app: AppState
     let chatID: UUID
     static let maxSteps = 30
-    static let googleFallback = "gemini-flash-lite-latest"
     /// After Google reports a model as busy, skip it for a while instead of waiting on it every turn.
     static var googleBusy: [String: Date] = [:]
+    /// Tools that act on the Mac itself; while one runs, the screen glows.
+    static let deviceTools: Set<String> = ["run_shell", "run_applescript", "open", "take_screenshot",
+                                           "browser_navigate", "browser_click", "browser_type", "browser_scroll", "browser_back"]
 
     var chat: Chat? { app.chatIndex(chatID).map { app.chats[$0] } }
 
@@ -64,6 +66,7 @@ struct Agent {
             update(msgID) { $0.toolCalls = calls }
             for call in calls {
                 if Task.isCancelled { return }
+                if Self.deviceTools.contains(call.name) { app.controlOverlay.show(chatID: chatID) }
                 let result = await Tools.run(call, ctx: ctx)
                 var m = ChatMessage(role: .tool, content: result.text)
                 m.toolCallID = call.id
@@ -71,6 +74,7 @@ struct Agent {
                 m.images = result.images
                 m.presentedFiles = result.presented
                 m.links = result.links
+                m.diff = result.diff
                 append(m)
             }
         }
@@ -85,32 +89,50 @@ struct Agent {
         if !tools.isEmpty { body["tools"] = tools }
         let thinkParams = Self.thinkingParams(provider: model.provider, model: model.id, level: think)
         var attempt = body.merging(thinkParams) { $1 }
-        if model.provider == .google, let until = Self.googleBusy[model.id], until > Date() {
-            attempt["model"] = Self.googleFallback
-            update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) is busy)" }
+        // Google fallbacks: a chain of working models, tried in order when one is busy or unavailable.
+        var tried: Set<String> = [model.id]
+        func nextFallback() -> String? { app.googleFallbackChain.first { !tried.contains($0) } }
+        if model.provider == .google, let until = Self.googleBusy[model.id], until > Date(), let next = nextFallback() {
+            attempt["model"] = next
+            tried.insert(next)
+            update(msgID) { $0.modelName = next + " (\(model.name) is busy)" }
         }
+        var badRequestRetries = 0
 
-        for tryNumber in 0..<4 {
+        while true {
             do {
                 return try await streamOnce(into: msgID, provider: model.provider, modelID: model.id, body: attempt)
             } catch let e as URLError where e.code == .timedOut && model.provider == .google
-                        && (attempt["model"] as? String) != Self.googleFallback && chatMessage(msgID)?.content.isEmpty != false {
-                attempt["model"] = Self.googleFallback
-                Self.googleBusy[model.id] = Date().addingTimeInterval(600)
-                update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) timed out)" }
+                        && chatMessage(msgID)?.content.isEmpty != false {
+                guard let next = nextFallback() else { throw e }
+                markGoogle(attempt["model"] as? String ?? model.id, .busy)
+                attempt["model"] = next
+                tried.insert(next)
+                update(msgID) { $0.modelName = next + " (\(model.name) timed out)" }
                 continue
-            } catch let e as APIError where e.status == 503 && model.provider == .google
-                        && (attempt["model"] as? String) != Self.googleFallback && chatMessage(msgID)?.content.isEmpty != false {
-                // Google is overloaded: answer with the lighter model instead of failing.
-                attempt["model"] = Self.googleFallback
-                Self.googleBusy[model.id] = Date().addingTimeInterval(600)
-                update(msgID) { $0.modelName = Self.googleFallback + " (\(model.name) is busy)" }
+            } catch let e as APIError where model.provider == .google && chatMessage(msgID)?.content.isEmpty != false
+                        && (e.status == 503 || e.status == 500 || e.status == 404 || (e.status == 429 && e.message.contains("limit: 0"))) {
+                guard let next = nextFallback() else { throw e }
+                // Busy, retired or not on the free tier: answer with another working model instead of failing.
+                let failed = attempt["model"] as? String ?? model.id
+                markGoogle(failed, e.status == 404 ? .unavailable("Retired for new keys")
+                                 : e.status == 429 ? .unavailable("Not on the free tier") : .busy)
+                attempt["model"] = next
+                tried.insert(next)
+                let why = e.status == 503 || e.status == 500 ? "is busy" : "isn't available on your key"
+                update(msgID) { $0.modelName = next + " (\(model.name) \(why))" }
                 continue
             } catch let e as APIError where e.status == 400 || e.status == 422 {
                 // Some models reject reasoning or tool parameters: retry with fewer extras.
                 let hadOutput = (chatMessage(msgID)?.content.isEmpty == false)
-                if hadOutput || tryNumber == 3 { throw e }
-                if tryNumber == 0 && !thinkParams.isEmpty { attempt = body; continue }
+                badRequestRetries += 1
+                if hadOutput || badRequestRetries > 2 { throw e }
+                if badRequestRetries == 1 && !thinkParams.isEmpty {
+                    let current = attempt["model"]
+                    attempt = body
+                    attempt["model"] = current
+                    continue
+                }
                 if attempt["tools"] != nil && e.message.lowercased().contains("tool") {
                     attempt["tools"] = nil
                     continue
@@ -118,7 +140,13 @@ struct Agent {
                 throw e
             }
         }
-        return []
+    }
+
+    /// Remembers that a Google model failed so the picker and fallbacks skip it for a while.
+    private func markGoogle(_ id: String, _ h: ModelHealth) {
+        let ref = app.remoteModels[.google]?.first { $0.id == id } ?? ModelRef(provider: .google, id: id, name: id)
+        app.setModelHealth(ref, h)
+        if h == .busy { Self.googleBusy[id] = Date().addingTimeInterval(600) }
     }
 
     private func streamOnce(into msgID: UUID, provider: ProviderID, modelID: String, body: [String: Any]) async throws -> [ToolCall] {
@@ -149,6 +177,8 @@ struct Agent {
                 case .toolCalls(let c): calls = c
                 case .usage(let u): app.usage.recordTokens(provider, u)
                 case .rateLimit(let r): app.usage.recordRateLimit(provider, r)
+                case .providerBlocks(let b): update(msgID) { $0.providerBlocks = b }
+                case .notice(let n): pendingContent += (pendingContent.isEmpty ? "" : "\n\n") + n
                 }
                 if Date().timeIntervalSince(lastFlush) > 0.05 { flush() }
             }
@@ -212,6 +242,18 @@ struct Agent {
                 return ["reasoning_effort": effort, "reasoning_format": "parsed"]
             }
             return [:]
+        case .anthropic:
+            guard AnthropicClient.supportsAdaptiveThinking(model) else { return [:] }
+            let effort = level == .off ? "low" : level == .standard ? "medium" : level == .high ? "high" : "max"
+            var p: [String: Any] = ["thinking": ["type": "adaptive"], "output_config": ["effort": effort]]
+            if AnthropicClient.supportsFallbacks(model) {
+                // If Claude's safety classifiers decline, the API re-runs the request on a fallback model.
+                p["fallbacks"] = "default"
+                p["_anthropic_beta"] = "server-side-fallback-2026-07-01"
+            }
+            return p
+        case .deepseek:
+            return [:]   // deepseek-reasoner always thinks; deepseek-chat never does
         case .openrouter:
             if level == .standard { return [:] }
             let effort: [String: Any] = ["effort": level == .off ? "low" : "high"]
@@ -244,6 +286,7 @@ struct Agent {
             if caps.imageGeneration { lines.append("- Generate images with generate_image when the user asks for a picture.") }
             if caps.computerAccess { lines.append("- Use the user's Mac: shell commands, files, AppleScript, opening apps, screenshots. The user approves risky actions. Prefer safe, reversible commands; never delete user data unless explicitly asked.") }
             if caps.browser { lines.append("- Drive the built-in browser: browser_navigate, then browser_click / browser_type using element numbers from the latest page read. Never enter passwords or payment details; ask the user to do that.") }
+            lines.append("- Make PowerPoint slide decks with create_presentation when the user asks for a presentation or slides. Don't paste the slides into the chat; the deck is shown as an attachment.")
             if caps.websites { lines.append("- Build websites with create_website. Write complete, polished, responsive HTML/CSS/JS; the site is hosted on localhost and opened for the user.") }
             if project != nil || caps.computerAccess { lines.append("- Read, write and present files. Use present_file to show finished documents to the user.") }
             if !lines.isEmpty { s += "\n\nYou can:\n" + lines.joined(separator: "\n") + "\nUse tools when they help; don't narrate tool calls at length." }
@@ -269,7 +312,7 @@ struct Agent {
 
     private func buildMessages(_ chat: Chat, model: ModelRef, project: Project?, tools: Bool) -> [[String: Any]] {
         var out: [[String: Any]] = [["role": "system", "content": systemPrompt(chat, project: project, tools: tools)]]
-        let vision = model.vision || model.provider == .google || model.provider == .custom
+        let vision = model.vision || [.google, .custom, .anthropic].contains(model.provider)
         var pendingImages: [String] = []
 
         func imagePart(_ path: String) -> [String: Any]? {
@@ -311,6 +354,12 @@ struct Agent {
             case .assistant:
                 flushImages()
                 var a: [String: Any] = ["role": "assistant", "content": m.content]
+                if model.provider == .anthropic, let blocks = m.providerBlocks?.any as? [Any], !blocks.isEmpty {
+                    a["anthropic_blocks"] = blocks
+                }
+                if model.provider == .deepseek, !m.toolCalls.isEmpty, !m.reasoning.isEmpty {
+                    a["reasoning_content"] = m.reasoning   // DeepSeek needs its reasoning back while a tool turn is in progress
+                }
                 if !m.toolCalls.isEmpty {
                     a["tool_calls"] = m.toolCalls.map { c -> [String: Any] in
                         var d: [String: Any] = ["id": c.id, "type": "function", "function": ["name": c.name, "arguments": c.arguments.isEmpty ? "{}" : c.arguments]]
@@ -351,7 +400,7 @@ struct Agent {
         case 401, 403: return "⚠️ \(model.provider.displayName) rejected the API key. Open Accounts (top right) to fix it.\n\n\(e.message)"
         case 429: return "⚠️ Rate limit reached for \(model.name). Wait a bit, or switch models. See Usage for details.\n\n\(e.message)"
         case 404: return "⚠️ Model not available: \(model.name).\n\n\(e.message)"
-        case 503: return "⚠️ \(model.provider.displayName) is overloaded right now. Try again or switch models.\n\n\(e.message)"
+        case 503, 529: return "⚠️ \(model.provider.displayName) is overloaded right now. Try again or switch models.\n\n\(e.message)"
         default: return "⚠️ " + (e.errorDescription ?? e.message)
         }
     }

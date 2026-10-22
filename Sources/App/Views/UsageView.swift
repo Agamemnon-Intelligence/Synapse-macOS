@@ -8,7 +8,7 @@ struct UsageView: View {
         ScrollView {
             PageHeader(title: "Usage", subtitle: "Free-tier usage per provider. Groq reports limits live; for others Synapse counts requests.") { EmptyView() }
             VStack(alignment: .leading, spacing: 16) {
-                ForEach([ProviderID.google, .groq, .openrouter, .custom], id: \.self) { p in
+                ForEach([ProviderID.google, .groq, .anthropic, .deepseek, .openrouter, .custom], id: \.self) { p in
                     if app.hasKey(p) || !app.usage.usage(p).days.isEmpty {
                         ProviderUsageCard(provider: p)
                     }

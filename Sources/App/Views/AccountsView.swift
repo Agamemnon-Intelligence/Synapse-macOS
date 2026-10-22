@@ -21,6 +21,8 @@ struct AccountsView: View {
                 VStack(spacing: 12) {
                     ProviderKeyRow(provider: .google, steps: "Sign in with your Google account → “Create API key” → copy it.")
                     ProviderKeyRow(provider: .groq, steps: "Sign in (Google, GitHub or email) → “Create API Key” → copy it.")
+                    ProviderKeyRow(provider: .anthropic, steps: "Sign in to the Claude Console → “Create Key” → copy it. Paid; uses your own credits.")
+                    ProviderKeyRow(provider: .deepseek, steps: "Sign in to the DeepSeek platform → “Create new API key” → copy it.")
                     ProviderKeyRow(provider: .openrouter, steps: "Sign in → “Create Key” → copy it. Free models end in “:free”.")
                     CustomProviderRow()
                     HuggingFaceTokenRow()

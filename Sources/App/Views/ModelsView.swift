@@ -390,7 +390,7 @@ struct CloudModelsView: View {
 
     var body: some View {
         List {
-            ForEach([ProviderID.google, .groq, .openrouter, .custom], id: \.self) { p in
+            ForEach([ProviderID.google, .groq, .anthropic, .deepseek, .openrouter, .custom], id: \.self) { p in
                 Section {
                     if p == .custom ? !app.settings.customEnabled : !app.hasKey(p) {
                         HStack {
@@ -407,8 +407,13 @@ struct CloudModelsView: View {
                     } else if let list = app.remoteModels[p] {
                         ForEach(list) { m in
                             HStack {
-                                Text(m.name)
+                                Text(m.name).foregroundStyle(app.isUsable(m) ? .primary : .tertiary)
                                 if m.vision { Image(systemName: "eye").foregroundStyle(.secondary).help("Understands images") }
+                                if case .unavailable(let why) = app.health(m) {
+                                    Text(why).font(.caption).foregroundStyle(.orange)
+                                } else if app.health(m) == .busy {
+                                    Text("Busy right now").font(.caption).foregroundStyle(.secondary)
+                                }
                                 Spacer()
                                 Button { openInTerminal(command: "synapse chat \"\(m.qualifiedID)\"") } label: { Image(systemName: "terminal") }
                                     .buttonStyle(.borderless).help("Chat in Terminal")

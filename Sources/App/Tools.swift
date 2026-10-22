@@ -7,6 +7,7 @@ struct ToolResult {
     var images: [String] = []
     var presented: [String] = []
     var links: [String] = []
+    var diff: FileDiff? = nil
 }
 
 @MainActor
@@ -46,12 +47,26 @@ enum Tools {
                  "aspect": ["type": "string", "enum": ["square", "landscape", "portrait"], "description": "Aspect ratio"] as [String: Any]],
                 required: ["prompt"])
         }
+        add("create_presentation", "Create a PowerPoint (.pptx) slide deck and show it to the user as an attachment they can present. Keep slides short: 3-6 bullets each.",
+            ["title": str("Deck title (also the title slide)"),
+             "subtitle": str("Optional subtitle for the title slide"),
+             "theme": ["type": "string", "enum": ["dark", "light", "warm"], "description": "Visual style"] as [String: Any],
+             "slides": ["type": "array", "description": "Content slides after the title slide",
+                        "items": ["type": "object",
+                                  "properties": ["title": str("Slide title"),
+                                                 "bullets": ["type": "array", "items": ["type": "string"] as [String: Any]] as [String: Any]],
+                                  "required": ["title", "bullets"]] as [String: Any]] as [String: Any]],
+            required: ["title", "slides"])
         if ctx.filesEnabled {
             let scope = ctx.capabilities.computerAccess ? "Paths may be absolute or relative to the working folder."
                                                         : "Paths are relative to the project folder."
             add("list_files", "List files and folders. " + scope, ["path": str("Folder path, default is the working folder")])
             add("read_file", "Read a text, code or PDF file. " + scope, ["path": str("File path")], required: ["path"])
             add("write_file", "Create or overwrite a text file. " + scope, ["path": str("File path"), "content": str("Full file contents")], required: ["path", "content"])
+            add("edit_file", "Change part of an existing text file by replacing old_text with new_text (old_text must match exactly, including whitespace). Prefer this over rewriting a whole file. " + scope,
+                ["path": str("File path"), "old_text": str("Exact text to replace (unique in the file)"), "new_text": str("Replacement text"),
+                 "replace_all": ["type": "boolean", "description": "Replace every occurrence"] as [String: Any]],
+                required: ["path", "old_text", "new_text"])
             add("present_file", "Show a file to the user as a preview card (documents, images, code, etc).", ["path": str("File path")], required: ["path"])
         }
         if ctx.capabilities.computerAccess {
@@ -95,6 +110,24 @@ enum Tools {
 
         switch call.name {
         case "web_search": return await webSearch(s("query"))
+        case "create_presentation":
+            let title = s("title").ifEmpty("Presentation")
+            let slides = (args["slides"] as? [[String: Any]] ?? []).map {
+                PresentationWriter.Slide(title: $0["title"] as? String ?? "", bullets: ($0["bullets"] as? [Any] ?? []).map { "\($0)" })
+            }
+            guard !slides.isEmpty else { return ToolResult(text: "Add at least one slide.") }
+            let theme: PresentationWriter.Theme = s("theme") == "light" ? .light : s("theme") == "warm" ? .warm : .dark
+            let folder = ctx.project?.folderURL ?? Paths.files
+            var url = folder.appendingPathComponent(SiteManager.slug(title).ifEmpty("presentation") + ".pptx")
+            var n = 2
+            while FileManager.default.fileExists(atPath: url.path) {
+                url = folder.appendingPathComponent(SiteManager.slug(title) + "-\(n).pptx"); n += 1
+            }
+            do {
+                let subtitle = s("subtitle").isEmpty ? nil : s("subtitle")
+                try await Task.detached { try PresentationWriter.write(title: title, subtitle: subtitle, slides: slides, theme: theme, to: url) }.value
+                return ToolResult(text: "Created \(url.lastPathComponent) with \(slides.count + 1) slides at \(url.path). It's shown to the user.", presented: [url.path])
+            } catch { return ToolResult(text: "Error: \(error.localizedDescription)") }
         case "fetch_url": return await fetchURL(s("url"))
         case "generate_image": return await ImageGen.generate(prompt: s("prompt"), aspect: s("aspect"))
 
@@ -113,13 +146,22 @@ enum Tools {
 
         case "write_file":
             guard let url = resolve(s("path"), ctx: ctx) else { return denied() }
-            let inside = ctx.project.map { url.path.hasPrefix($0.folderURL.path) } ?? false
-            if !inside, !(await approve(ctx, "Write file", "Synapse wants to write \(url.path)")) { return declined() }
-            do {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try s("content").write(to: url, atomically: true, encoding: .utf8)
-                return ToolResult(text: "Wrote \(url.path)", presented: [url.path])
-            } catch { return ToolResult(text: "Error: \(error.localizedDescription)") }
+            let old = try? String(contentsOf: url, encoding: .utf8)
+            return await applyChange(url: url, old: old, new: s("content"), ctx: ctx)
+
+        case "edit_file":
+            guard let url = resolve(s("path"), ctx: ctx) else { return denied() }
+            guard let old = try? String(contentsOf: url, encoding: .utf8) else { return ToolResult(text: "Error: \(url.path) doesn't exist or isn't text. Use write_file to create it.") }
+            let find = s("old_text"), replace = s("new_text")
+            guard !find.isEmpty else { return ToolResult(text: "Error: old_text is empty.") }
+            let count = old.components(separatedBy: find).count - 1
+            if count == 0 { return ToolResult(text: "Error: old_text wasn't found in \(url.lastPathComponent). Read the file again and copy the text exactly.") }
+            let all = args["replace_all"] as? Bool ?? false
+            if count > 1 && !all { return ToolResult(text: "Error: old_text appears \(count) times. Include more surrounding lines so it's unique, or set replace_all.") }
+            let new: String
+            if all { new = old.replacingOccurrences(of: find, with: replace) }
+            else if let r = old.range(of: find) { new = old.replacingCharacters(in: r, with: replace) } else { new = old }
+            return await applyChange(url: url, old: old, new: new, ctx: ctx)
 
         case "present_file":
             guard let url = resolve(s("path"), ctx: ctx) else { return denied() }
@@ -214,9 +256,24 @@ enum Tools {
     }
     static func declined() -> ToolResult { ToolResult(text: "The user declined this action.") }
 
-    static func approve(_ ctx: ToolContext, _ title: String, _ detail: String, force: Bool = false) async -> Bool {
+    static func approve(_ ctx: ToolContext, _ title: String, _ detail: String, force: Bool = false, diff: FileDiff? = nil) async -> Bool {
         if ctx.autoApprove && !force { return true }
-        return await ctx.app.requestApproval(title: title, detail: detail)
+        return await ctx.app.requestApproval(title: title, detail: detail, diff: diff)
+    }
+
+    /// Shows the diff for approval first, then writes the file.
+    static func applyChange(url: URL, old: String?, new: String, ctx: ToolContext) async -> ToolResult {
+        let diff = Differ.diff(path: url.path, old: old, new: new)
+        if old == new { return ToolResult(text: "No changes: \(url.lastPathComponent) already has this content.", diff: diff) }
+        let verb = old == nil ? "Create" : "Update"
+        guard await approve(ctx, "\(verb) \(url.lastPathComponent)", url.path, diff: diff) else { return declined() }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try new.write(to: url, atomically: true, encoding: .utf8)
+            let summary = old == nil ? "Created \(url.path) (\(diff.added) lines)"
+                                     : "Updated \(url.path) with \(diff.added) additions and \(diff.removed) removals"
+            return ToolResult(text: summary, diff: diff)
+        } catch { return ToolResult(text: "Error: \(error.localizedDescription)") }
     }
 
     static func resolve(_ path: String, ctx: ToolContext) -> URL? {
@@ -242,28 +299,57 @@ enum Tools {
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15"
 
     static func webSearch(_ query: String) async -> ToolResult {
-        var req = URLRequest(url: URL(string: "https://html.duckduckgo.com/html/")!)
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return ToolResult(text: "Empty search query.") }
+        // DuckDuckGo's HTML page first, its Lite page as a backup (their markup changes now and then).
+        var results = await duckDuckGo(q, endpoint: "https://html.duckduckgo.com/html/")
+        if results.isEmpty { results = await duckDuckGo(q, endpoint: "https://lite.duckduckgo.com/lite/") }
+        guard !results.isEmpty else {
+            return ToolResult(text: "No results for “\(q)” (the search service may be rate-limiting). Try fetch_url on a likely page instead.")
+        }
+        let lines = results.prefix(8).enumerated().map { n, r in "\(n + 1). \(r.title)\n   \(r.url)\n   \(r.snippet)" }
+        return ToolResult(text: "Results for “\(q)”:\n\n" + lines.joined(separator: "\n\n"))
+    }
+
+    struct SearchResult { let title: String; let url: String; let snippet: String }
+
+    static func duckDuckGo(_ query: String, endpoint: String) async -> [SearchResult] {
+        var req = URLRequest(url: URL(string: endpoint)!, timeoutInterval: 20)
         req.httpMethod = "POST"
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
+        req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data(("q=" + (query.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? query)).utf8)
-        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return ToolResult(text: "Search failed (offline?).") }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        req.httpBody = Data(("q=" + (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query) + "&kl=wt-wt").utf8)
+        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return [] }
         let html = String(decoding: data, as: UTF8.self)
-        let blocks = html.components(separatedBy: "class=\"result__body").dropFirst()
-        var results: [String] = []
-        for (n, b) in blocks.prefix(8).enumerated() {
-            guard let href = firstMatch(#"class="result__a"[^>]*href="([^"]+)""#, b) ?? firstMatch(#"href="([^"]+)"[^>]*class="result__a""#, b) else { continue }
-            var link = href.replacingOccurrences(of: "&amp;", with: "&")
+
+        // Every result link carries class "result__a" (HTML page) or "result-link" (Lite page), in any attribute order.
+        let anchor = #"<a\b[^>]*class=['"][^'"]*\b(?:result__a|result-link)\b[^'"]*['"][^>]*>(.*?)</a>"#
+        guard let re = try? NSRegularExpression(pattern: anchor, options: [.dotMatchesLineSeparators, .caseInsensitive]) else { return [] }
+        let ns = html as NSString
+        let matches = re.matches(in: html, range: NSRange(location: 0, length: ns.length))
+        var out: [SearchResult] = []
+        for (i, m) in matches.enumerated() {
+            let tag = ns.substring(with: m.range)
+            guard var link = firstMatch(#"href=['"]([^'"]+)['"]"#, tag) else { continue }
+            link = link.replacingOccurrences(of: "&amp;", with: "&")
             if let r = link.range(of: "uddg="), let enc = link[r.upperBound...].split(separator: "&").first {
                 link = String(enc).removingPercentEncoding ?? link
             }
             if link.hasPrefix("//") { link = "https:" + link }
-            if link.contains("duckduckgo.com/y.js") { continue }   // ads
-            let title = stripHTML(firstMatch(#"class="result__a"[^>]*>(.*?)</a>"#, b) ?? "")
-            let snippet = stripHTML(firstMatch(#"class="result__snippet"[^>]*>(.*?)</a>"#, b) ?? "")
-            results.append("\(n + 1). \(title)\n   \(link)\n   \(snippet)")
+            if link.contains("duckduckgo.com/y.js") || !link.hasPrefix("http") { continue }   // ads / internal
+            let title = stripHTML(ns.substring(with: m.range(at: 1)))
+            // The snippet sits between this result and the next one.
+            let nextStart = i + 1 < matches.count ? matches[i + 1].range.location : ns.length
+            let tail = ns.substring(with: NSRange(location: m.range.location + m.range.length,
+                                                  length: max(0, min(nextStart, ns.length) - m.range.location - m.range.length)))
+            let snippet = stripHTML(firstMatch(#"class=['"][^'"]*(?:result__snippet|result-snippet)[^'"]*['"][^>]*>(.*?)</(?:a|td|div)>"#, tail) ?? "")
+            if !out.contains(where: { $0.url == link }) { out.append(SearchResult(title: title, url: link, snippet: snippet)) }
         }
-        return ToolResult(text: results.isEmpty ? "No results for “\(query)”." : "Results for “\(query)”:\n\n" + results.joined(separator: "\n\n"))
+        return out
     }
 
     static func fetchURL(_ s: String) async -> ToolResult {

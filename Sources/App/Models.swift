@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Providers & model references
 
 enum ProviderID: String, Codable, CaseIterable, Identifiable {
-    case local, google, groq, openrouter, custom
+    case local, google, groq, anthropic, deepseek, openrouter, custom
     var id: String { rawValue }
 
     var displayName: String {
@@ -11,6 +11,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         case .local: return "On this Mac"
         case .google: return "Google AI Studio"
         case .groq: return "Groq"
+        case .anthropic: return "Claude (Anthropic)"
+        case .deepseek: return "DeepSeek"
         case .openrouter: return "OpenRouter"
         case .custom: return "Custom (OpenAI-compatible)"
         }
@@ -21,6 +23,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         case .local: return "desktopcomputer"
         case .google: return "sparkle"
         case .groq: return "bolt.fill"
+        case .anthropic: return "asterisk"
+        case .deepseek: return "water.waves"
         case .openrouter: return "arrow.triangle.branch"
         case .custom: return "server.rack"
         }
@@ -31,6 +35,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         case .local: return "http://127.0.0.1:\(LocalEngine.port)/v1"
         case .google: return "https://generativelanguage.googleapis.com/v1beta/openai"
         case .groq: return "https://api.groq.com/openai/v1"
+        case .anthropic: return "https://api.anthropic.com/v1"
+        case .deepseek: return "https://api.deepseek.com/v1"
         case .openrouter: return "https://openrouter.ai/api/v1"
         case .custom: return AppSettings.shared.customBaseURL
         }
@@ -41,6 +47,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .google: return URL(string: "https://aistudio.google.com/apikey")
         case .groq: return URL(string: "https://console.groq.com/keys")
+        case .anthropic: return URL(string: "https://platform.claude.com/settings/keys")
+        case .deepseek: return URL(string: "https://platform.deepseek.com/api_keys")
         case .openrouter: return URL(string: "https://openrouter.ai/settings/keys")
         default: return nil
         }
@@ -50,6 +58,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .google: return URL(string: "https://aistudio.google.com/usage")
         case .groq: return URL(string: "https://console.groq.com/settings/limits")
+        case .anthropic: return URL(string: "https://platform.claude.com/usage")
+        case .deepseek: return URL(string: "https://platform.deepseek.com/usage")
         case .openrouter: return URL(string: "https://openrouter.ai/activity")
         default: return nil
         }
@@ -59,6 +69,8 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .google: return "Free tier with per-minute and per-day request limits per model."
         case .groq: return "Free tier, very fast. Limits are reported live with every reply."
+        case .anthropic: return "Paid API with your own key. Limits are reported live with every reply."
+        case .deepseek: return "Low-cost API with your own key. Strong at reasoning and code."
         case .openrouter: return "Models ending in “:free” cost nothing (about 50 requests/day without credits)."
         case .custom: return "Any server that speaks the OpenAI chat API."
         case .local: return "Runs privately on your Mac. No key, no limits."
@@ -196,6 +208,8 @@ struct ChatMessage: Codable, Hashable, Identifiable {
     var toolCallID: String?
     var toolName: String?
     var images: [String] = []          // generated/screenshot images to show (and to send to vision models)
+    var providerBlocks: JSONValue?     // Claude's raw content blocks (thinking + tool_use), sent back unchanged
+    var diff: FileDiff?                 // file change made by write_file / edit_file
     var presentedFiles: [String] = []  // files the model asked to show the user
     var links: [String] = []           // e.g. localhost site URLs
     var isError = false

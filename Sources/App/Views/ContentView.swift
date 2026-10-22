@@ -189,27 +189,45 @@ struct ApprovalView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(request.title).font(.headline)
-                Text("The model wants to do this. Allow only if you expect it.").font(.callout).foregroundStyle(.secondary)
+            if let diff = request.diff {
+                // File change: show exactly what will change before anything is written.
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Text((diff.isNewFile ? "Create " : "Update ") + diff.fileName)
+                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        DiffCounts(added: diff.added, removed: diff.removed)
+                    }
+                    Text(diff.path).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                ScrollView { DiffView(diff: diff, collapsedLines: 400) }
+                    .frame(maxHeight: 380)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(request.title).font(.headline)
+                    Text("The model wants to do this. Allow only if you expect it.").font(.callout).foregroundStyle(.secondary)
+                }
+                ScrollView {
+                    Text(request.detail)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                }
+                .frame(maxHeight: 240)
+                .background(Theme.fill, in: RoundedRectangle(cornerRadius: 8))
             }
-            ScrollView {
-                Text(request.detail)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-            }
-            .frame(maxHeight: 240)
-            .background(Theme.fill, in: RoundedRectangle(cornerRadius: 8))
             HStack {
+                if request.diff != nil {
+                    Text("Nothing is written until you allow it.").font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("Deny", role: .cancel) { app.resolveApproval(request.id, false) }.keyboardShortcut(.cancelAction)
-                Button("Allow") { app.resolveApproval(request.id, true) }.keyboardShortcut(.defaultAction)
+                Button(request.diff == nil ? "Allow" : "Apply Changes") { app.resolveApproval(request.id, true) }.keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(width: 480)
+        .frame(width: request.diff == nil ? 480 : 640)
         .interactiveDismissDisabled()
     }
 }

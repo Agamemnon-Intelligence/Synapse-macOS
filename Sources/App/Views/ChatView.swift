@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import QuickLook
+import QuickLookThumbnailing
 
 struct ChatView: View {
     @Environment(AppState.self) private var app
@@ -51,9 +52,12 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 20) {
-                    ForEach(chat.messages) { m in
+                    // Tool results render inside their call's step row, Claude Code style.
+                    let results = Dictionary(chat.messages.compactMap { m in m.role == .tool ? (m.toolCallID ?? "", m) : nil },
+                                             uniquingKeysWith: { a, _ in a })
+                    ForEach(chat.messages.filter { $0.role != .tool }) { m in
                         MessageRow(message: m, isLast: m.id == chat.messages.last?.id, generating: isGenerating,
-                                   onRegenerate: { app.regenerate(chatID: chatID) })
+                                   results: results, onRegenerate: { app.regenerate(chatID: chatID) })
                             .id(m.id)
                     }
                     Color.clear.frame(height: 1).id("bottom")
@@ -71,9 +75,12 @@ struct ChatView: View {
     // MARK: Composer
 
     private var composer: some View {
-        Composer(chatID: chatID, draft: $draft, attachments: $attachments, isGenerating: isGenerating,
+        VStack(spacing: 8) {
+            UsageBanner(chatID: chatID)
+            Composer(chatID: chatID, draft: $draft, attachments: $attachments, isGenerating: isGenerating,
                  onAttach: { importing = true }, onSend: send, onStop: { app.stop(chatID) },
                  onPaste: handleDrop)
+        }
             .padding(.horizontal, 24).padding(.bottom, 16).padding(.top, 4)
             .frame(maxWidth: 780)
             .frame(maxWidth: .infinity)
@@ -282,10 +289,21 @@ struct ModelPicker: View {
                     }
                 }
             }
-            ForEach([ProviderID.google, .groq, .openrouter, .custom], id: \.self) { p in
-                if let list = app.remoteModels[p], !list.isEmpty {
+            ForEach([ProviderID.google, .groq, .anthropic, .deepseek, .openrouter, .custom], id: \.self) { p in
+                // Only offer models that actually work on this key (retired / paid-only ones are hidden).
+                let list = (app.remoteModels[p] ?? []).filter { app.isUsable($0) }
+                if !list.isEmpty {
                     Section(p.displayName) {
-                        ForEach(list.prefix(40)) { m in Button(m.name) { selection = m } }
+                        ForEach(list.prefix(40)) { m in
+                            Button { selection = m } label: {
+                                let busy = app.health(m) == .busy
+                                if selection?.qualifiedID == m.qualifiedID {
+                                    Label(m.name + (busy ? " · busy" : ""), systemImage: "checkmark")
+                                } else {
+                                    Text(m.name + (busy ? " · busy" : ""))
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -322,14 +340,14 @@ struct MessageRow: View {
     let message: ChatMessage
     let isLast: Bool
     let generating: Bool
+    var results: [String: ChatMessage] = [:]
     var onRegenerate: () -> Void
 
     var body: some View {
         switch message.role {
         case .user: userRow
         case .assistant: assistantRow
-        case .tool: ToolRow(message: message)
-        case .system: EmptyView()
+        case .tool, .system: EmptyView()
         }
     }
 
@@ -376,7 +394,14 @@ struct MessageRow: View {
                     MarkdownView(text: message.content)
                 }
             }
-            ForEach(message.toolCalls) { c in ToolCallLabel(call: c) }
+            if !message.toolCalls.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(message.toolCalls) { c in
+                        ToolStep(call: c, result: results[c.id], running: generating && results[c.id] == nil)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
             if !message.content.isEmpty && !live && message.toolCalls.isEmpty && !message.isError {
                 HStack(spacing: 14) {
                     Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(message.content, forType: .string) } label: {
@@ -415,116 +440,84 @@ struct ThinkingIndicator: View {
     }
 }
 
-struct ToolCallLabel: View {
-    let call: ToolCall
-
-    var body: some View {
-        let (icon, text) = Self.describe(call)
-        HStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 11)).frame(width: 14)
-            Text(text).lineLimit(1).truncationMode(.tail)
-        }
-        .font(.callout)
-        .foregroundStyle(.secondary)
-    }
-
-    static func describe(_ c: ToolCall) -> (String, String) {
-        let a = (try? JSONSerialization.jsonObject(with: Data(c.arguments.utf8)) as? [String: Any]) ?? [:]
-        let v: (String) -> String = { (a[$0] as? String) ?? (a[$0].map { "\($0)" } ?? "") }
-        switch c.name {
-        case "web_search": return ("magnifyingglass", "Searched “\(v("query"))”")
-        case "fetch_url": return ("doc.text", "Read \(URL(string: v("url"))?.host ?? v("url"))")
-        case "generate_image": return ("photo", "Generated an image")
-        case "run_shell": return ("terminal", v("command"))
-        case "run_applescript": return ("applescript", "Ran AppleScript")
-        case "open": return ("arrow.up.forward.app", "Opened \(v("target"))")
-        case "take_screenshot": return ("camera.viewfinder", "Took a screenshot")
-        case "list_files": return ("folder", "Listed \(v("path").ifEmpty("files"))")
-        case "read_file": return ("doc", "Read \((v("path") as NSString).lastPathComponent)")
-        case "write_file": return ("square.and.pencil", "Wrote \((v("path") as NSString).lastPathComponent)")
-        case "present_file": return ("eye", "Shared \((v("path") as NSString).lastPathComponent)")
-        case "browser_navigate": return ("globe", "Opened \(URL(string: v("url"))?.host ?? v("url"))")
-        case "browser_read": return ("doc.richtext", "Read the page")
-        case "browser_click": return ("cursorarrow.click", "Clicked")
-        case "browser_type": return ("keyboard", "Typed “\(v("text"))”")
-        case "browser_scroll": return ("arrow.up.and.down", "Scrolled \(v("direction"))")
-        case "browser_back": return ("chevron.backward", "Went back")
-        case "browser_screenshot": return ("camera", "Looked at the page")
-        case "create_website": return ("chevron.left.forwardslash.chevron.right", "Built “\(v("name"))”")
-        default: return ("wrench.and.screwdriver", c.name)
-        }
-    }
-}
-
-struct ToolRow: View {
-    let message: ChatMessage
-    @State private var expanded = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { expanded.toggle() } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold)).rotationEffect(.degrees(expanded ? 90 : 0))
-                    Text(expanded ? "Hide output" : "Output")
-                }
-                .font(.caption).foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 21)
-            if expanded {
-                ScrollView {
-                    Text(message.content)
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                }
-                .frame(maxHeight: 220)
-                .background(Theme.fill, in: RoundedRectangle(cornerRadius: 8))
-            }
-            ForEach(message.images, id: \.self) { path in
-                if let img = NSImage(contentsOfFile: path) {
-                    Image(nsImage: img).resizable().scaledToFit()
-                        .frame(maxWidth: 480, maxHeight: 480)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .contextMenu {
-                            Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
-                            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
-                        }
-                        .onTapGesture(count: 2) { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
-                }
-            }
-            ForEach(message.presentedFiles, id: \.self) { path in FileCard(path: path) }
-            ForEach(message.links, id: \.self) { link in
-                if let url = URL(string: link) {
-                    Link(destination: url) { Label(link, systemImage: "arrow.up.right.square") }.font(.callout)
-                }
-            }
-        }
-        .padding(.top, -12)
-    }
-}
-
+/// A file the model made or shared, shown as a compact glass attachment (decks can be presented).
 struct FileCard: View {
     let path: String
     @State private var preview: URL?
+    @State private var thumbnail: NSImage?
+
+    private var url: URL { URL(fileURLWithPath: path) }
+    private var ext: String { url.pathExtension.lowercased() }
+    private var isDeck: Bool { ["pptx", "ppt", "key"].contains(ext) }
+    private var wide: Bool { isDeck || ["pdf", "docx", "doc", "pages"].contains(ext) }
 
     var body: some View {
-        let url = URL(fileURLWithPath: path)
-        HStack(spacing: 10) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: path)).resizable().frame(width: 30, height: 30)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(url.lastPathComponent).font(.callout.weight(.medium))
-                Text(url.pathExtension.uppercased()).font(.caption2).foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            ZStack {
+                if let thumbnail {
+                    Image(nsImage: thumbnail).resizable().scaledToFill()
+                } else {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: path)).resizable().scaledToFit().padding(wide ? 14 : 2)
+                }
             }
-            Spacer()
-            Button("Preview") { preview = url }.controlSize(.small)
-            Button("Open") { NSWorkspace.shared.open(url) }.controlSize(.small)
+            .frame(width: wide ? 104 : 40, height: wide ? 58 : 40)
+            .background(Color.black.opacity(0.25))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.border))
+            .onTapGesture { preview = url }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(url.lastPathComponent).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                Text(kindLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if isDeck {
+                Button { preview = url } label: {
+                    Label("Present", systemImage: "play.fill").font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .foregroundStyle(.white)
+                        .glass(Capsule(), tint: Theme.accent.opacity(0.85), interactive: true)
+                }
+                .buttonStyle(.plain)
+                .help("Present with Quick Look (use the arrow keys to move between slides)")
+            } else {
+                Button { preview = url } label: { Image(systemName: "eye") }.buttonStyle(.borderless).help("Preview")
+            }
+            Menu {
+                Button("Open in Default App") { NSWorkspace.shared.open(url) }
+                if isDeck {
+                    Button("Open in Keynote") {
+                        NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/Applications/Keynote.app"),
+                                                configuration: NSWorkspace.OpenConfiguration())
+                    }
+                }
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         }
-        .padding(10)
-        .frame(maxWidth: 460)
-        .background(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border))
+        .padding(.horizontal, 10).padding(.vertical, 9)
+        .frame(maxWidth: 470)
+        .glass(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .quickLookPreview($preview)
+        .task(id: path) { thumbnail = await Self.makeThumbnail(url) }
+    }
+
+    private var kindLabel: String {
+        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64).flatMap { $0 }.map(formatBytes) ?? ""
+        let kind: String
+        switch ext {
+        case "pptx", "ppt": kind = "PowerPoint presentation"
+        case "key": kind = "Keynote presentation"
+        case "pdf": kind = "PDF document"
+        case "docx", "doc": kind = "Word document"
+        default: kind = ext.uppercased() + " file"
+        }
+        return size.isEmpty ? kind : "\(kind) · \(size)"
+    }
+
+    static func makeThumbnail(_ url: URL) async -> NSImage? {
+        let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 208, height: 116), scale: 2, representationTypes: .thumbnail)
+        return try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).nsImage
     }
 }
 
@@ -573,5 +566,29 @@ struct DropOverlay: View {
             .overlay(Text("Drop to attach").font(.headline).foregroundStyle(Theme.accent))
             .padding(10)
             .allowsHitTesting(false)
+    }
+}
+
+
+/// Warns above the composer when the chat's provider is close to its rate limit.
+struct UsageBanner: View {
+    @Environment(AppState.self) private var app
+    let chatID: UUID
+
+    var body: some View {
+        if let i = app.chatIndex(chatID), let p = (app.chats[i].model ?? app.defaultModel)?.provider,
+           let warning = app.usageWarning(for: p), !app.dismissedWarnings.contains(warning) {
+            HStack(spacing: 10) {
+                Image(systemName: "gauge.with.dots.needle.67percent").foregroundStyle(.orange)
+                Text(warning).font(.system(size: 12)).lineLimit(2)
+                Spacer(minLength: 6)
+                Button("Usage") { app.selection = .usage }.buttonStyle(.borderless).font(.system(size: 12, weight: .medium))
+                Button { app.dismissedWarnings.insert(warning) } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)) }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .glass(Capsule(), tint: Color.orange.opacity(0.18))
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
     }
 }

@@ -28,6 +28,13 @@ enum Paths {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+    /// Documents the AI creates outside a project (presentations etc.).
+    static var files: URL {
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Synapse Files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
     static var stateFile: URL { support.appendingPathComponent("state.json") }
     static var usageFile: URL { support.appendingPathComponent("usage.json") }
     static var settingsFile: URL { support.appendingPathComponent("settings.json") }
@@ -107,7 +114,7 @@ final class AppSettings: Codable {
     var apiServerEnabled = true
     var apiServerPort: UInt16 = 11435
     var systemPrompt = ""
-    var defaultModel: ModelRef? = ModelRef(provider: .google, id: "gemini-3.8-flash", name: "gemini-3.8-flash", vision: true)
+    var defaultModel: ModelRef?   // nil = pick the best model that works right now
     var shellTimeout: Double = 120
 
     func save() {
